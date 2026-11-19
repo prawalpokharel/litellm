@@ -4815,6 +4815,7 @@ name = "litellm-repositories"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "jiff",
  "litellm-db",
  "litellm-error",
  "litellm-python-compat",
@@ -4825,6 +4826,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "uuid",
  "veil",
 ]
 

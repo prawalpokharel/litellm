@@ -67,7 +67,6 @@ from litellm.proxy._types import (
     Litellm_EntityType,
     LiteLLM_ManagedVectorStoresTable,
     LiteLLM_ObjectPermissionTable,
-    LiteLLM_OrganizationMembershipTable,
     LiteLLM_OrganizationTable,
     LiteLLM_ProjectTableCachedObj,
     LiteLLM_TagTable,
@@ -186,7 +185,7 @@ from litellm.repositories.table_repositories import (
 from litellm.repositories.tag_repository import TagRepository
 from litellm.repositories.team_membership_repository import TeamMembershipRepository
 from litellm.repositories.team_repository import TeamRepository
-from litellm.repositories.user_repository import UserRepository
+from litellm.repositories.user_repository import NewUserDefaults, UserRepository
 from litellm.repositories.verification_token_repository import VerificationTokenRepository
 from litellm.responses.additional_tools import additional_tools_in_input
 from litellm.router import Router
@@ -222,24 +221,10 @@ else:
     Span = Any
 
 
-class _PrismaModelDumpRow(Protocol):
-    def model_dump(self) -> Mapping[str, object]: ...
-
-
 class _PrismaVectorStoreRow(Protocol):
     def dict(self) -> Mapping[str, object]: ...
 
     def model_dump(self) -> Mapping[str, object]: ...
-
-    def __iter__(self) -> Iterator[tuple[str, object]]: ...
-
-
-class _PrismaUserRow(Protocol):
-    @property
-    def organization_memberships(self) -> Sequence[_PrismaModelDumpRow | None] | None: ...
-
-    @organization_memberships.setter
-    def organization_memberships(self, value: Sequence[_PrismaModelDumpRow] | None) -> None: ...
 
     def __iter__(self) -> Iterator[tuple[str, object]]: ...
 
@@ -320,10 +305,6 @@ class _DeadlineBoundedTable(Generic[RowT_co]):
 
 def _vector_store_table(repo: _PrismaTableHolder[_PrismaVectorStoreRow]) -> _PrismaAuthTable[_PrismaVectorStoreRow]:
     return _DeadlineBoundedTable(repo.table, "vector_store")
-
-
-def _user_table(repo: _PrismaTableHolder[_PrismaUserRow]) -> _PrismaAuthTable[_PrismaUserRow]:
-    return _DeadlineBoundedTable(repo.table, "user")
 
 
 GrantLayer = Literal["key", "team", "user"]
@@ -3024,12 +3005,6 @@ def _email_fallback_links_any_user() -> bool:
     return str_to_bool(os.environ.get("LITELLM_EMAIL_FALLBACK_LINKS_ANY_USER")) is True
 
 
-async def _email_free_to_store(prisma_client: PrismaClient, user_email: str | None, user_id: str) -> str | None:
-    if user_email is None or await email_belongs_to_another_user(prisma_client, user_email, user_id):
-        return None
-    return user_email
-
-
 async def email_belongs_to_another_user(prisma_client: PrismaClient, user_email: str, user_id: str) -> bool:
     if _email_fallback_links_any_user():
         return False
@@ -3138,51 +3113,37 @@ async def get_user_object(
             from litellm.proxy.management_helpers.utils import initial_budget_windows_json
 
             default_params: Final = _default_internal_user_params()
-            scalar_default_params: Final = {
-                key: value for key, value in default_params.items() if key not in ("teams", "available_teams")
-            }
-            new_user_email: Final = await _email_free_to_store(prisma_client, user_email, user_id)
-            new_user_params: Final[dict[str, Any]] = {
-                "user_id": user_id,
-                **({"user_email": new_user_email} if new_user_email is not None else {}),
-                **(
-                    {"sso_user_id": sso_user_id}
-                    if sso_user_id is not None and not _email_fallback_links_any_user()
-                    else {}
+            defaults: Final = NewUserDefaults.model_validate(default_params)
+            inserted: Final = await UserRepository(prisma_client).insert_for_auth(
+                user_id,
+                sso_user_id=sso_user_id,
+                user_email=user_email,
+                links_any_user=_email_fallback_links_any_user(),
+                defaults=defaults,
+                budget_reset_at=(
+                    None
+                    if defaults.budget_duration is None
+                    else get_budget_reset_time(budget_duration=defaults.budget_duration)
                 ),
-                **scalar_default_params,
-                **(
-                    {"budget_limits": initial_budget_windows_json(scalar_default_params["budget_limits"])}
-                    if "budget_limits" in scalar_default_params
-                    else {}
+                budget_limits_json=(
+                    initial_budget_windows_json(default_params["budget_limits"])
+                    if "budget_limits" in default_params
+                    else None
                 ),
-            }
-            if new_user_params.get("budget_duration") is not None and new_user_params.get("budget_reset_at") is None:
-                new_user_params["budget_reset_at"] = get_budget_reset_time(
-                    budget_duration=new_user_params["budget_duration"]
-                )
-
-            response = await _user_table(UserRepository(prisma_client, use_writer=bool(check_db_only))).create(
-                data=new_user_params,
-                include={"organization_memberships": True},
             )
+            if inserted.user is None:
+                raise UserNotFoundError(user_id=user_id)
 
-            default_teams: Final = check_if_default_team_set()
+            default_teams: Final = check_if_default_team_set() if inserted.created else None
             if default_teams:
                 await add_new_user_to_default_team(
                     user_id=user_id,
-                    user_email=new_user_email,
+                    user_email=inserted.user.user_email,
                     user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
                     teams=default_teams,
                     prisma_client=prisma_client,
                 )
-            if response.organization_memberships is not None and len(response.organization_memberships) > 0:
-                response.organization_memberships = [
-                    LiteLLM_OrganizationMembershipTable.model_validate(membership.model_dump())
-                    for membership in response.organization_memberships
-                    if membership is not None
-                ]
-            _response = LiteLLM_UserTable.model_validate(dict(response))
+            _response = inserted.user
         elif _response is None:
             if should_check_db:
                 _update_last_db_access_time(

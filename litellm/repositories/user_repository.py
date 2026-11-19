@@ -7,10 +7,11 @@ import json
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, contextmanager
 from contextvars import ContextVar
+from datetime import datetime
 from itertools import chain
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final, NamedTuple, Protocol
 
-from pydantic import TypeAdapter
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from litellm.litellm_core_utils.core_helpers import require_attributes
 from litellm.models.user import LiteLLM_UserTable, SCIMPlaceholder
@@ -52,6 +53,24 @@ def free_sso_user_creation(user_id: str | None, *, enabled: bool = True) -> Gene
         yield
     finally:
         _FREE_SSO_CREATION.reset(token)
+
+
+class NewUserDefaults(BaseModel):
+    """The keys of ``default_internal_user_params`` stored on a user created at sign-in. Its other keys are ignored."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    user_role: str | None = None
+    max_budget: float | None = None
+    budget_duration: str | None = None
+    models: tuple[str, ...] | None = None
+
+
+class InsertedUser(NamedTuple):
+    """The user now stored, None when the one that beat this insert is gone again, and whether this insert wrote it."""
+
+    user: LiteLLM_UserTable | None
+    created: bool
 
 
 class _UserDb(Protocol):
@@ -143,6 +162,38 @@ class UserRepository(BaseRepository[LiteLLM_UserTable]):
         return await rust_database.required_repository(RustUserRepository).backfill_email(
             user_id, user_email, links_any_user=links_any_user
         )
+
+    async def set_role(self, user_id: str, user_role: str) -> LiteLLM_UserTable | None:
+        """The user with its role set to ``user_role``, or None when no row has that id."""
+        payload: Final = await rust_database.required_repository(RustUserRepository).set_role(user_id, user_role)
+        return rust_database.decode(LiteLLM_UserTable, payload)
+
+    async def insert_for_auth(
+        self,
+        user_id: str,
+        *,
+        sso_user_id: str | None,
+        user_email: str | None,
+        links_any_user: bool,
+        defaults: NewUserDefaults,
+        budget_reset_at: datetime | None,
+        budget_limits_json: str | None,
+    ) -> InsertedUser:
+        """Creates the user a sign-in names. The email is stored unless another user holds it and the SSO id only
+        while ``links_any_user`` is off. A sign-in that loses to a concurrent one gets the user that won."""
+        created, payload = await rust_database.required_repository(RustUserRepository).insert(
+            user_id,
+            sso_user_id=sso_user_id,
+            user_email=user_email,
+            links_any_user=links_any_user,
+            user_role=defaults.user_role,
+            max_budget=defaults.max_budget,
+            budget_duration=defaults.budget_duration,
+            budget_reset_at=None if budget_reset_at is None else budget_reset_at.timestamp(),
+            models=defaults.models,
+            budget_limits=budget_limits_json,
+        )
+        return InsertedUser(rust_database.decode(LiteLLM_UserTable, payload), created)
 
     async def find_by_email(self, user_email: str) -> LiteLLM_UserTable | None:
         """Find a user by email."""

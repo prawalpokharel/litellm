@@ -1245,71 +1245,47 @@ def test_get_cli_jwt_auth_token_no_fallback_when_budget_provided(
     assert json.loads(decrypted).get("max_budget") is None
 
 
+def _no_user_yet() -> tuple[MagicMock, MagicMock]:
+    """A Prisma double with no user row, and an empty cache."""
+    prisma_client: Final = MagicMock()
+    prisma_client.db = AsyncMock()
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
+    prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
+    cache: Final = MagicMock()
+    cache.async_get_cache = AsyncMock(return_value=None)
+    cache.async_set_cache = AsyncMock()
+    return prisma_client, cache
+
+
 @pytest.mark.asyncio
 async def test_default_internal_user_params_with_get_user_object(rust_auth_stores: RustAuthStores, monkeypatch):
     """Test that default_internal_user_params is used when creating a new user via get_user_object"""
-    # Set up default_internal_user_params
-    default_params = {
-        "models": ["gpt-4", "claude-3-opus"],
-        "max_budget": 200.0,
-        "user_role": "internal_user",
-    }
-    monkeypatch.setattr(litellm, "default_internal_user_params", default_params)
+    monkeypatch.setattr(
+        litellm,
+        "default_internal_user_params",
+        {"models": ["gpt-4", "claude-3-opus"], "max_budget": 200.0, "user_role": LitellmUserRoles.INTERNAL_USER},
+    )
+    prisma_client, cache = _no_user_yet()
+    _rust_stores_over_prisma(rust_auth_stores, prisma_client)
 
-    # Mock the necessary dependencies
-    mock_prisma_client = MagicMock()
-    mock_db = AsyncMock()
-    mock_prisma_client.db = mock_db
+    user_obj: Final = await get_user_object(
+        user_id="new_test_user",
+        prisma_client=prisma_client,
+        user_api_key_cache=cache,
+        user_id_upsert=True,
+        proxy_logging_obj=None,
+    )
 
-    # Set up the user creation mock - create a complete user model that can be converted to a dict
-    mock_user = MagicMock()
-    mock_user.user_id = "new_test_user"
-    mock_user.models = ["gpt-4", "claude-3-opus"]
-    mock_user.max_budget = 200.0
-    mock_user.user_role = "internal_user"
-    mock_user.organization_memberships = []
-
-    # Make the mock model_dump or dict method return appropriate data
-    mock_user.dict = lambda: {
-        "user_id": "new_test_user",
-        "models": ["gpt-4", "claude-3-opus"],
-        "max_budget": 200.0,
-        "user_role": "internal_user",
-        "organization_memberships": [],
-    }
-
-    # Setup the mock returns
-    _rust_stores_over_prisma(rust_auth_stores, mock_prisma_client)
-    mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
-    mock_prisma_client.db.litellm_usertable.create = AsyncMock(return_value=mock_user)
-
-    # Create a mock cache - use AsyncMock for async methods
-    mock_cache = MagicMock()
-    mock_cache.async_get_cache = AsyncMock(return_value=None)
-    mock_cache.async_set_cache = AsyncMock()
-
-    # Call get_user_object with user_id_upsert=True to trigger user creation
-    try:
-        user_obj = await get_user_object(
-            user_id="new_test_user",
-            prisma_client=mock_prisma_client,
-            user_api_key_cache=mock_cache,
-            user_id_upsert=True,
-            proxy_logging_obj=None,
-        )
-    except Exception as e:
-        # this fails since the mock object is a MagicMock and not a LiteLLM_UserTable
-        print(e)
-
-    # Verify the user was created with the default params
-    mock_prisma_client.db.litellm_usertable.create.assert_called_once()
-    creation_args = mock_prisma_client.db.litellm_usertable.create.call_args[1]["data"]
-
-    # Verify defaults were applied to the creation args
-    assert "models" in creation_args
-    assert creation_args["models"] == ["gpt-4", "claude-3-opus"]
-    assert creation_args["max_budget"] == 200.0
-    assert creation_args["user_role"] == "internal_user"
+    assert [
+        (inserted["user_id"], inserted["models"], inserted["max_budget"], inserted["user_role"])
+        for inserted in rust_auth_stores.user.inserts
+    ] == [("new_test_user", ("gpt-4", "claude-3-opus"), 200.0, "internal_user")]
+    assert user_obj is not None
+    assert (user_obj.models, user_obj.max_budget, user_obj.user_role) == (
+        ["gpt-4", "claude-3-opus"],
+        200.0,
+        "internal_user",
+    )
 
 
 @pytest.mark.asyncio
@@ -1325,39 +1301,25 @@ async def test_get_user_object_upsert_sets_budget_reset_at(
     if has_budget_duration:
         default_params["budget_duration"] = "24h"
     monkeypatch.setattr(litellm, "default_internal_user_params", default_params)
+    prisma_client, cache = _no_user_yet()
+    _rust_stores_over_prisma(rust_auth_stores, prisma_client)
+    before: Final = datetime.now(timezone.utc)
 
-    mock_prisma_client = MagicMock()
-    mock_prisma_client.db = AsyncMock()
-    _rust_stores_over_prisma(rust_auth_stores, mock_prisma_client)
-    mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
-    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
-    mock_prisma_client.db.litellm_usertable.create = AsyncMock(return_value=MagicMock(organization_memberships=[]))
+    user_obj: Final = await get_user_object(
+        user_id=f"jwt_upsert_reset_at_{has_budget_duration}",
+        prisma_client=prisma_client,
+        user_api_key_cache=cache,
+        user_id_upsert=True,
+        proxy_logging_obj=None,
+    )
 
-    mock_cache = MagicMock()
-    mock_cache.async_get_cache = AsyncMock(return_value=None)
-    mock_cache.async_set_cache = AsyncMock()
-
-    user_id = f"jwt_upsert_reset_at_{has_budget_duration}"
-    try:
-        await get_user_object(
-            user_id=user_id,
-            prisma_client=mock_prisma_client,
-            user_api_key_cache=mock_cache,
-            user_id_upsert=True,
-            proxy_logging_obj=None,
-        )
-    except Exception as e:
-        print(e)
-
-    mock_prisma_client.db.litellm_usertable.create.assert_called_once()
-    creation_args = mock_prisma_client.db.litellm_usertable.create.call_args[1]["data"]
-
+    assert user_obj is not None
+    (inserted,) = rust_auth_stores.user.inserts
     if has_budget_duration:
-        reset_at = creation_args.get("budget_reset_at")
-        assert isinstance(reset_at, datetime), f"expected a computed budget_reset_at, got {creation_args!r}"
-        assert reset_at > datetime.now(timezone.utc)
+        assert user_obj.budget_reset_at is not None and user_obj.budget_reset_at > before
+        assert inserted["budget_reset_at"] == user_obj.budget_reset_at.timestamp()
     else:
-        assert "budget_reset_at" not in creation_args
+        assert (inserted["budget_reset_at"], user_obj.budget_reset_at) == (None, None)
 
 
 @pytest.mark.asyncio
@@ -1374,36 +1336,54 @@ async def test_get_user_object_upsert_starts_each_default_window_with_its_own_re
             ]
         },
     )
-    prisma_client: Final = MagicMock()
-    prisma_client.db = AsyncMock()
+    prisma_client, cache = _no_user_yet()
     _rust_stores_over_prisma(rust_auth_stores, prisma_client)
-    prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
-    prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
-    prisma_client.db.litellm_usertable.create = AsyncMock(return_value=MagicMock(organization_memberships=[]))
-    cache: Final = MagicMock()
-    cache.async_get_cache = AsyncMock(return_value=None)
-    cache.async_set_cache = AsyncMock()
     resets_before_call: Final = {duration: get_budget_reset_time(duration) for duration in ("1h", "30d")}
 
-    try:
-        await get_user_object(
-            user_id="jwt_upsert_windows",
-            prisma_client=prisma_client,
-            user_api_key_cache=cache,
-            user_id_upsert=True,
-            proxy_logging_obj=None,
-        )
-    except Exception as e:
-        print(e)
+    await get_user_object(
+        user_id="jwt_upsert_windows",
+        prisma_client=prisma_client,
+        user_api_key_cache=cache,
+        user_id_upsert=True,
+        proxy_logging_obj=None,
+    )
 
     resets_after_call: Final = {duration: get_budget_reset_time(duration) for duration in ("1h", "30d")}
-    windows: Final = json.loads(prisma_client.db.litellm_usertable.create.call_args[1]["data"]["budget_limits"])
+    (inserted,) = rust_auth_stores.user.inserts
+    windows: Final = json.loads(str(inserted["budget_limits"]))
     assert [window["budget_duration"] for window in windows] == ["1h", "30d"]
     assert all(
         datetime.fromisoformat(window["reset_at"])
         in (resets_before_call[window["budget_duration"]], resets_after_call[window["budget_duration"]])
         for window in windows
     )
+
+
+@pytest.mark.asyncio
+async def test_get_user_object_upsert_that_loses_to_a_concurrent_sign_in_returns_the_user_that_won(
+    rust_auth_stores: RustAuthStores, monkeypatch
+):
+    monkeypatch.setattr(litellm, "default_internal_user_params", {"teams": ["default-team"]})
+    rust_auth_stores.user.writer = {"racing_user": {"user_id": "racing_user", "user_role": "proxy_admin"}}
+    cache: Final = MagicMock()
+    cache.async_get_cache = AsyncMock(return_value=None)
+    cache.async_set_cache = AsyncMock()
+
+    with patch(
+        "litellm.proxy.management_endpoints.internal_user_endpoints.add_new_user_to_default_team",
+        new_callable=AsyncMock,
+    ) as mock_add_to_team:
+        user_obj: Final = await get_user_object(
+            user_id="racing_user",
+            prisma_client=MagicMock(),
+            user_api_key_cache=cache,
+            user_id_upsert=True,
+            proxy_logging_obj=None,
+        )
+
+    assert user_obj is not None
+    assert (user_obj.user_id, user_obj.user_role) == ("racing_user", "proxy_admin")
+    mock_add_to_team.assert_not_awaited()
 
 
 def _user_read_raising(stores: RustAuthStores, error: Exception) -> tuple[MagicMock, MagicMock]:
@@ -1514,63 +1494,27 @@ async def test_get_user_object_check_db_only_ignores_recent_miss(rust_auth_store
 
 
 @pytest.mark.asyncio
-async def test_get_user_object_upsert_includes_user_email(rust_auth_stores: RustAuthStores):
-    """Test that user_email is included when creating a new user via get_user_object upsert"""
-    # Mock the necessary dependencies
-    mock_prisma_client = MagicMock()
-    mock_db = AsyncMock()
-    mock_prisma_client.db = mock_db
+@pytest.mark.parametrize(("email_holder", "stored_email"), [(None, "test@example.com"), (MagicMock(), None)])
+async def test_get_user_object_upsert_stores_the_email_unless_another_user_holds_it(
+    rust_auth_stores: RustAuthStores, email_holder: MagicMock | None, stored_email: str | None
+):
+    prisma_client, cache = _no_user_yet()
+    prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=email_holder)
+    _rust_stores_over_prisma(rust_auth_stores, prisma_client)
 
-    # Set up the user creation mock
-    mock_user = MagicMock()
-    mock_user.user_id = "new_test_user"
-    mock_user.user_email = "test@example.com"
-    mock_user.models = []
-    mock_user.max_budget = None
-    mock_user.user_role = None
-    mock_user.organization_memberships = []
+    user_obj: Final = await get_user_object(
+        user_id="new_test_user",
+        prisma_client=prisma_client,
+        user_api_key_cache=cache,
+        user_id_upsert=True,
+        proxy_logging_obj=None,
+        user_email="test@example.com",
+    )
 
-    mock_user.dict = lambda: {
-        "user_id": "new_test_user",
-        "user_email": "test@example.com",
-        "models": [],
-        "max_budget": None,
-        "user_role": None,
-        "organization_memberships": [],
-    }
-
-    # Setup the mock returns - user does not exist
-    _rust_stores_over_prisma(rust_auth_stores, mock_prisma_client)
-    mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
-    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
-    mock_prisma_client.db.litellm_usertable.create = AsyncMock(return_value=mock_user)
-
-    # Create a mock cache
-    mock_cache = MagicMock()
-    mock_cache.async_get_cache = AsyncMock(return_value=None)
-    mock_cache.async_set_cache = AsyncMock()
-
-    # Call get_user_object with user_id_upsert=True and user_email
-    try:
-        await get_user_object(
-            user_id="new_test_user",
-            prisma_client=mock_prisma_client,
-            user_api_key_cache=mock_cache,
-            user_id_upsert=True,
-            proxy_logging_obj=None,
-            user_email="test@example.com",
-        )
-    except Exception as e:
-        # May fail since mock object is not a real LiteLLM_UserTable
-        print(e)
-
-    # Verify the user was created with user_email included
-    mock_prisma_client.db.litellm_usertable.create.assert_called_once()
-    creation_args = mock_prisma_client.db.litellm_usertable.create.call_args[1]["data"]
-
-    assert "user_email" in creation_args, "user_email should be included when upserting a new user"
-    assert creation_args["user_email"] == "test@example.com"
-    assert creation_args["user_id"] == "new_test_user"
+    (inserted,) = rust_auth_stores.user.inserts
+    assert (inserted["user_id"], inserted["user_email"]) == ("new_test_user", "test@example.com")
+    assert user_obj is not None
+    assert user_obj.user_email == stored_email
 
 
 @pytest.mark.asyncio
@@ -1774,7 +1718,7 @@ async def test_get_user_object_backfill_caches_persisted_email_not_proposed(rust
 @pytest.mark.asyncio
 async def test_get_user_object_upsert_routes_default_team_to_membership(rust_auth_stores: RustAuthStores, monkeypatch):
     """Regression for LIT-4324: a configured default team (list of NewUserRequestTeam
-    dicts) must not be written into the Prisma create payload (teams is a String[] column
+    dicts) must not be written into the user row (teams is a String[] column
     that rejects dicts). Instead it must be routed through add_new_user_to_default_team so
     the JWT-provisioned user gets a real team membership."""
     default_params = {
@@ -1782,41 +1726,23 @@ async def test_get_user_object_upsert_routes_default_team_to_membership(rust_aut
         "teams": [{"team_id": "default-team", "user_role": "user"}],
     }
     monkeypatch.setattr(litellm, "default_internal_user_params", default_params)
-
-    mock_prisma_client = MagicMock()
-    mock_prisma_client.db = AsyncMock()
-    _rust_stores_over_prisma(rust_auth_stores, mock_prisma_client)
-    mock_prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=None)
-    mock_prisma_client.db.litellm_usertable.find_first = AsyncMock(return_value=None)
-
-    mock_user = MagicMock()
-    mock_user.organization_memberships = []
-    mock_prisma_client.db.litellm_usertable.create = AsyncMock(return_value=mock_user)
-
-    mock_cache = MagicMock()
-    mock_cache.async_get_cache = AsyncMock(return_value=None)
-    mock_cache.async_set_cache = AsyncMock()
+    prisma_client, cache = _no_user_yet()
+    _rust_stores_over_prisma(rust_auth_stores, prisma_client)
 
     with patch(
         "litellm.proxy.management_endpoints.internal_user_endpoints.add_new_user_to_default_team",
         new_callable=AsyncMock,
     ) as mock_add_to_team:
-        try:
-            await get_user_object(
-                user_id="new_jwt_user",
-                prisma_client=mock_prisma_client,
-                user_api_key_cache=mock_cache,
-                user_id_upsert=True,
-                proxy_logging_obj=None,
-            )
-        except Exception as e:
-            # mock_user is a MagicMock, so the post-create LiteLLM_UserTable(**dict(...))
-            # conversion raises; irrelevant to what we assert.
-            print(e)
+        user_obj: Final = await get_user_object(
+            user_id="new_jwt_user",
+            prisma_client=prisma_client,
+            user_api_key_cache=cache,
+            user_id_upsert=True,
+            proxy_logging_obj=None,
+        )
 
-    creation_args = mock_prisma_client.db.litellm_usertable.create.call_args[1]["data"]
-    assert "teams" not in creation_args, "teams must be popped before the Prisma create"
-    assert creation_args["user_role"] == "internal_user"
+    assert user_obj is not None
+    assert (user_obj.user_role, user_obj.teams) == ("internal_user", [])
 
     mock_add_to_team.assert_awaited_once()
     passed_teams = mock_add_to_team.await_args[1]["teams"]
