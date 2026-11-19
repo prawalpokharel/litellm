@@ -46,5 +46,7 @@ pub use project::{Project, ProjectRepository};
 use raw_json::RawJson;
 pub use tag::{Tag, TagRepository};
 pub use team::{Team, TeamRepository};
-pub use team_membership::{TeamMembership, TeamMembershipRepository};
+pub use team_membership::{
+    AddedMember, MemberAdd, MemberBudget, NewMemberBudget, TeamMembership, TeamMembershipRepository,
+};
 pub use user::{NewUserDefaults, SignIn, User, UserRepository};
