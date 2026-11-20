@@ -15,7 +15,13 @@ from litellm.litellm_core_utils.fallback_generalizations import match_capability
 from litellm.litellm_core_utils.reasoning_effort_capability import resolve_supported_reasoning_efforts
 from litellm.llms.openai.chat.gpt_reasoning_transformation import is_gpt_reasoning_series_name
 from litellm.llms.openai_like.json_loader import JSONProviderRegistry
-from litellm.types.utils import CompletionTokensDetailsWrapper, PromptTokensDetailsWrapper, SearchFreeRequests, Usage
+from litellm.types.utils import (
+    CacheCreationTokenDetails,
+    CompletionTokensDetailsWrapper,
+    PromptTokensDetailsWrapper,
+    SearchFreeRequests,
+    Usage,
+)
 from litellm.utils import ProviderConfigManager
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -911,6 +917,86 @@ def test_tencent_tokenhub_kimi_rows_match_published_metadata(path: Path):
     )
     assert actual == TENCENT_TOKENHUB_KIMI_ROWS
     assert invalid_metadata == ()
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        "deepseek/deepseek-v4.1-flash",
+        "deepseek/deepseek-v4.1-flash-1017",
+        "inclusionai/ling-3.0-flash-fin",
+        "inclusionai/ling-3.0-flash-sante",
+        "inclusionai/ling-3.0-flash-vl",
+        "inclusionai/ling-3.1-flash",
+        "moonshotai/kimi-k3.1-pro",
+        "moonshotai/kimi-k3.1-pro-highspeed",
+        "qwen/qwen3.8-2.4t-a95b",
+        "qwen/qwen3.8-27b",
+        "qwen/qwen3.8-flash",
+        "qwen/qwen4-max",
+        "stepfun/step-5-preview",
+        "tencent/hy4",
+        "tencent/hy4-flash",
+        "tencent/hy4-preview",
+        "xiaomimimo/mimo-v2.6-flash",
+        "xiaomimimo/mimo-v2.6-pro",
+        "zai-org/glm-5.3-flash",
+        "zai-org/glm-5.3-flashX",
+    ),
+)
+def test_novita_catalog_models_are_priced_with_their_cache_read_rate(model: str, local_model_cost_map: None) -> None:
+    """Novita lists these models with prices in its public catalog (api.novita.ai/v3/openai/models, read 2026-11-19)."""
+    usage: Final = Usage(
+        prompt_tokens=10_000,
+        completion_tokens=1_000,
+        prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=4_000),
+    )
+    prompt_cost, completion_cost = litellm.cost_per_token(model=model, custom_llm_provider="novita", usage_object=usage)
+
+    row: Final = litellm.model_cost[f"novita/{model}"]
+    input_rate: Final = row["input_cost_per_token"]
+    cache_read_rate: Final = row["cache_read_input_token_cost"]
+    output_rate: Final = row["output_cost_per_token"]
+    assert 0 < cache_read_rate < input_rate and output_rate > 0
+    assert (prompt_cost, completion_cost) == pytest.approx(
+        (6_000 * input_rate + 4_000 * cache_read_rate, 1_000 * output_rate)
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "one_hour_writes"),
+    (
+        ("moonshotai/kimi-k3.1-pro", 2_000),
+        ("moonshotai/kimi-k3.1-pro-highspeed", 2_000),
+        ("qwen/qwen3.8-flash", 0),
+        ("qwen/qwen4-max", 2_000),
+    ),
+)
+def test_novita_catalog_models_bill_cache_writes_at_their_write_rates(
+    model: str, one_hour_writes: int, local_model_cost_map: None
+) -> None:
+    """Novita lists cache-write prices for these models, and a 1-hour one for all but Qwen3.8 Flash
+    (api.novita.ai/v3/openai/models, read 2026-11-19)."""
+    usage: Final = Usage(
+        prompt_tokens=10_000,
+        completion_tokens=0,
+        prompt_tokens_details=PromptTokensDetailsWrapper(
+            cache_creation_tokens=3_000,
+            cache_creation_token_details=CacheCreationTokenDetails(
+                ephemeral_5m_input_tokens=3_000 - one_hour_writes, ephemeral_1h_input_tokens=one_hour_writes
+            ),
+        ),
+    )
+    prompt_cost, _ = litellm.cost_per_token(model=model, custom_llm_provider="novita", usage_object=usage)
+
+    row: Final = litellm.model_cost[f"novita/{model}"]
+    input_rate: Final = row["input_cost_per_token"]
+    write_rate: Final = row["cache_creation_input_token_cost"]
+    one_hour_rate: Final = row["cache_creation_input_token_cost_above_1hr"] if one_hour_writes else write_rate
+    assert input_rate <= write_rate <= one_hour_rate
+    assert prompt_cost == pytest.approx(
+        7_000 * input_rate + (3_000 - one_hour_writes) * write_rate + one_hour_writes * one_hour_rate
+    )
 
 
 class TestBedrockClaude35SonnetContextWindow:
